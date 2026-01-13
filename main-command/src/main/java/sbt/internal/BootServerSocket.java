@@ -12,12 +12,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.UnsupportedEncodingException;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Method;
-import java.net.Socket;
-import java.net.ServerSocket;
-import java.net.SocketException;
-import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
@@ -125,13 +119,13 @@ public class BootServerSocket implements AutoCloseable {
                           ByteBuffer buf = ByteBuffer.allocate(1);
                           int bytesRead = channel.read(buf);
                           if (bytesRead > 0) {
-                            int b = buf.get(0);
-                            if (b != -1) {
-                              bytes.put(b);
-                              clientSocketReads.put(ClientSocket.this);
-                            } else {
-                              alive.set(false);
-                            }
+                            buf.flip();
+                            int b = buf.get() & 0xFF;
+                            bytes.put(b);
+                            clientSocketReads.put(ClientSocket.this);
+                          } else if (bytesRead == -1) {
+                            // End of stream
+                            alive.set(false);
                           }
                         }
 
@@ -151,10 +145,8 @@ public class BootServerSocket implements AutoCloseable {
     private void write(final int i) {
       try {
         if (alive.get()) {
-          ByteBuffer buf = ByteBuffer.allocate(4);
-          buf.putInt(i);
-          buf.rewind();
-          this.channel.write(buf);
+          byte[] bytes = {(byte) i};
+          this.channel.write(ByteBuffer.wrap(bytes));
         }
       } catch (final IOException e) {
         alive.set(false);
@@ -277,12 +269,38 @@ public class BootServerSocket implements AutoCloseable {
 
   private final Runnable acceptRunnable =
       () -> {
-        // TODO
-        // serverChannel.setSoTimeout(5000);
+        boolean usePolling = false;
+        try {
+          // First, try to set a timeout on the underlying socket.
+          // This works for ForwardingServerSocketChannel (older JDKs and Windows).
+          serverChannel.socket().setSoTimeout(5000);
+        } catch (Exception e) {
+          // socket() might return null or throw for JDK 17+ native channels.
+          // In this case, use non-blocking mode with polling.
+          try {
+            serverChannel.configureBlocking(false);
+            usePolling = true;
+          } catch (IOException ioe) {
+            // configureBlocking failed, we'll rely on close() to interrupt
+          }
+        }
+
         while (running.get()) {
           try {
-            ClientSocket clientSocket = new ClientSocket(serverChannel.accept());
-          } catch (final SocketTimeoutException e) {
+            SocketChannel client = serverChannel.accept();
+            if (client != null) {
+              if (usePolling) {
+                client.configureBlocking(true);
+              }
+              ClientSocket clientSocket = new ClientSocket(client);
+            } else if (usePolling) {
+              // Non-blocking mode, no client available
+              Thread.sleep(100);
+            }
+          } catch (final java.net.SocketTimeoutException e) {
+            // Expected for socket timeout mode, just continue
+          } catch (final InterruptedException e) {
+            running.set(false);
           } catch (final IOException e) {
             running.set(false);
           }
